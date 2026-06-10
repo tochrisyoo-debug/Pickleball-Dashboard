@@ -13,11 +13,11 @@
         body { font-family: 'Pretendard', sans-serif; }
     </style>
 </head>
-<body class="bg-slate-950 text-white">
+<body class="bg-slate-950 text-white select-none">
     <div id="root"></div>
 
     <script type="text/babel">
-        // --- 엔진 및 스토리지 세팅 ---
+        // --- 로컬 스토리지 데이터 코어 ---
         const getLocalStorage = (key, defaultVal) => {
             const saved = localStorage.getItem(key);
             return saved ? JSON.parse(saved) : defaultVal;
@@ -36,8 +36,6 @@
 
         function App() {
             const [activeTab, setActiveTab] = React.useState('tv');
-            
-            // 대회 타입 상태: 'league' (리그전) 또는 'tournament' (토너먼트 단판제)
             const [tournamentType, setTournamentType] = React.useState(() => getLocalStorage('pb_type', 'league'));
             
             const [numTeamsA, setNumTeamsA] = React.useState(() => getLocalStorage('pb_numTeamsA', 6));
@@ -49,8 +47,6 @@
             const [matches, setMatches] = React.useState(() => getLocalStorage('pb_matches', []));
             
             const [selectedGroup, setSelectedGroup] = React.useState('A');
-            
-            // TV 순환 모드 상태: 'A_RANK' ➡️ 'B_RANK' ➡️ 'LIVE_COURT'
             const [tvScreenMode, setTvScreenMode] = React.useState('A_RANK');
             const [autoRotate, setAutoRotate] = React.useState(true);
             const [toast, setToast] = React.useState(null);
@@ -72,27 +68,32 @@
                 return () => window.removeEventListener('storage_update', handleStorageUpdate);
             }, []);
 
-            // TV 화면 삼각 로테이션 (순위A -> 순위B -> 현재 코트 현황)
+            // TV 화면 삼각 로테이션 스위칭 엔진
             React.useEffect(() => {
                 if (!autoRotate) return;
                 const interval = setInterval(() => {
                     setTvScreenMode(prev => {
-                        if (prev === 'A_RANK') return 'B_RANK';
-                        if (prev === 'B_RANK') return 'LIVE_COURT';
-                        return 'A_RANK';
+                        if (tournamentType === 'league') {
+                            if (prev === 'A_RANK') return 'B_RANK';
+                            if (prev === 'B_RANK') return 'LIVE_COURT';
+                            return 'A_RANK';
+                        } else {
+                            if (prev === 'A_RANK') return 'B_RANK'; // 토너먼트일 때는 조별 대진표 트리뷰로 가동됨
+                            if (prev === 'B_RANK') return 'LIVE_COURT';
+                            return 'A_RANK';
+                        }
                     });
-                }, 12000); // 12초 주기로 완전 자동 회전
+                }, 12000);
                 return () => clearInterval(interval);
-            }, [autoRotate]);
+            }, [autoRotate, tournamentType]);
 
             const showToast = (msg) => {
                 setToast(msg);
                 setTimeout(() => setToast(null), 2500);
             };
 
-            // 통합 대진표 생성기 (리그전 & 토너먼트 완벽 분기)
             const handleGenerateSchedule = () => {
-                if (matches.length > 0 && !confirm("⚠️ 새로운 대진표를 만들면 기존 입력한 모든 점수와 순위가 초기화됩니다. 진행할까요?")) return;
+                if (matches.length > 0 && !confirm("⚠️ 대진표를 다시 짜면 기존 모든 결과가 리셋됩니다. 계속할까요?")) return;
 
                 setLocalStorage('pb_type', tournamentType);
                 setLocalStorage('pb_numTeamsA', numTeamsA);
@@ -100,7 +101,6 @@
                 setLocalStorage('pb_maxGamesA', maxGamesA);
                 setLocalStorage('pb_maxGamesB', maxGamesB);
 
-                // 동적 팀 빌딩
                 const updatedTeams = [];
                 for(let i=1; i<=numTeamsA; i++) {
                     const ex = teams.find(t => t.id === `A${i}`);
@@ -116,7 +116,6 @@
                 let allGames = [];
 
                 if (tournamentType === 'league') {
-                    // --- [1] 리그전 알고리즘 (골고루 원하는 경기수만큼) ---
                     const makeLeague = (groupName, groupTeams, limit) => {
                         let list = [...groupTeams];
                         if (list.length % 2 !== 0) list.push({ id: 'BYE', name: '부전승' });
@@ -127,7 +126,7 @@
                             for (let i = 0; i < NT / 2; i++) {
                                 const t1 = list[i]; const t2 = list[NT - 1 - i];
                                 if (t1.id !== 'BYE' && t2.id !== 'BYE') {
-                                    rGames.push({ group: groupName, team1Id: t1.id, team2Id: t2.id, roundName: `${r+1}라운드` });
+                                    rGames.push({ group: groupName, team1Id: t1.id, team2Id: t2.id, roundName: `${r+1}R` });
                                 }
                             }
                             rounds.push(rGames);
@@ -142,38 +141,29 @@
                     allGames.push(...makeLeague('B', updatedTeams.filter(t => t.group === 'B'), maxGamesB));
 
                 } else {
-                    // --- [2] 토너먼트 알고리즘 (홀수 부전승 완벽 계산 나무 트리 구조) ---
+                    // 토너먼트 최초 1R 대진 빌더
                     const makeTournamentRound1 = (groupName, groupTeams) => {
                         const list = [...groupTeams];
                         const NT = list.length;
                         if (NT < 2) return [];
 
-                        // 토너먼트 규격 확보 (4, 8, 16, 32강)
                         let bracketSize = 4;
                         if (NT > 4) bracketSize = 8;
                         if (NT > 8) bracketSize = 16;
-                        if (NT > 16) bracketSize = 32;
 
-                        const r1MatchesCount = NT - (bracketSize / 2); // 1라운드에 실제로 싸워야 하는 매치 수
+                        const r1MatchesCount = NT - (bracketSize / 2);
                         const tGames = [];
 
-                        // 1라운드 실제 격돌 매치 생성
                         for(let i=0; i<r1MatchesCount; i++) {
-                            const t1 = list.shift();
-                            const t2 = list.shift();
-                            tGames.push({ group: groupName, team1Id: t1.id, team2Id: t2.id, roundName: '토너먼트 1R', tournamentRound: 1, matchIdx: i+1 });
+                            const t1 = list.shift(); const t2 = list.shift();
+                            tGames.push({ group: groupName, team1Id: t1.id, team2Id: t2.id, roundName: '토너먼트 1R' });
                         }
-                        
-                        // 남은 팀들은 자동으로 부전승(BYE) 처리되어 다음 라운드(2R) 가상 슬롯 대기
-                        // 이 데이터들은 경기 결과 처리 시 자동으로 진출하도록 설계됩니다.
                         return tGames;
                     };
-
                     allGames.push(...makeTournamentRound1('A', updatedTeams.filter(t => t.group === 'A')));
                     allGames.push(...makeTournamentRound1('B', updatedTeams.filter(t => t.group === 'B')));
                 }
 
-                // 시간 테이블 및 코트 배치 레이아웃 시스템
                 let currentMin = (() => {
                     const [h, m] = startTime.split(':').map(Number);
                     return h * 60 + m;
@@ -195,58 +185,44 @@
                     return {
                         id: `match_${idx + 1}`,
                         ...g,
-                        score1: null,
-                        score2: null,
-                        completed: false,
-                        time: matchTime,
-                        court: courtName
+                        score1: null, score2: null, completed: false,
+                        time: matchTime, court: courtName
                     };
                 });
 
                 setMatches(finalMatches);
                 setLocalStorage('pb_matches', finalMatches);
-                showToast("🏆 새로운 최첨단 대진표 생성이 완료되었습니다!");
+                showToast("🏆 맞춤식 스마트 대진표 배치가 끝났습니다!");
             };
 
-            // 경기 종료 및 승자 자동 진출(토너먼트용) 로직 포함 스코어 세이브
             const saveScore = (matchId, s1, s2, completed) => {
                 let updated = matches.map(m => m.id === matchId ? { ...m, score1: s1, score2: s2, completed } : m);
                 
-                // 만약 토너먼트 모드이고 라운드가 끝났을 때 승자를 자동으로 다음 라운드 대진으로 올려주는 마법 기능
                 if (completed && tournamentType === 'tournament') {
-                    const completedMatch = updated.find(m => m.id === matchId);
-                    const group = completedMatch.group;
-                    const winnerId = s1 > s2 ? completedMatch.team1Id : completedMatch.team2Id;
+                    const comp = updated.find(m => m.id === matchId);
+                    const group = comp.group;
+                    const winnerId = s1 > s2 ? comp.team1Id : comp.team2Id;
 
-                    // 현재 라운드의 모든 경기가 끝났는지 체크 후 다음 라운드 자동 개설 가능
-                    const activeGroupMatches = updated.filter(m => m.group === group && m.roundName === completedMatch.roundName);
+                    const activeGroupMatches = updated.filter(m => m.group === group && m.roundName === comp.roundName);
                     const allDone = activeGroupMatches.every(m => m.completed);
 
                     if (allDone) {
-                        // 현재 라운드에서 이기고 올라온 승자들 취합
                         const winners = activeGroupMatches.map(m => (m.score1 > m.score2 ? m.team1Id : m.team2Id));
-                        
-                        // 대기하던 부전승(BYE) 팀들 소환
                         const allGroupTeams = teams.filter(t => t.group === group);
                         const playedTeams = new Set();
                         activeGroupMatches.forEach(m => { playedTeams.add(m.team1Id); playedTeams.add(m.team2Id); });
                         const byeTeams = allGroupTeams.filter(t => !playedTeams.has(t.id)).map(t => t.id);
 
-                        // 다음 라운드 진출자 최종 명단
                         const nextRoundTeams = [...winners, ...byeTeams];
                         
                         if (nextRoundTeams.length >= 2) {
                             let nextRoundLabel = "토너먼트 2R";
                             if (nextRoundTeams.length <= 2) nextRoundLabel = "🥇 최종 결승전";
                             else if (nextRoundTeams.length <= 4) nextRoundLabel = "🏅 4강 준결승";
-                            else if (nextRoundTeams.length <= 8) nextRoundLabel = "8강전";
 
-                            // 이미 해당 다음 라운드가 만들어져있는지 검증 가드
                             const alreadyMade = updated.some(m => m.group === group && m.roundName === nextRoundLabel);
                             if (!alreadyMade) {
                                 const nextMatches = [];
-                                let timeCounter = 1; 
-                                
                                 for(let i=0; i<nextRoundTeams.length; i+=2) {
                                     if(nextRoundTeams[i+1]) {
                                         nextMatches.push({
@@ -255,12 +231,11 @@
                                             team1Id: nextRoundTeams[i],
                                             team2Id: nextRoundTeams[i+1],
                                             score1: null, score2: null, completed: false,
-                                            time: "다음 타임", court: `${(i/2)+1}코트`,
+                                            time: "진행중", court: `${(i/2)+1}코트`,
                                             roundName: nextRoundLabel
                                         });
                                     } else {
-                                        // 또 홀수면 단독 결승 자동진출이나 추가 부전승 처리
-                                        alert(`🎉 ${nextRoundTeams[i]}팀이 다음 라운드 한 번 더 부전승 처리되었습니다!`);
+                                        alert(`🎉 ${nextRoundTeams[i]}팀이 대진 수 관계로 다음 단계 자동 부전승 진출!`);
                                     }
                                 }
                                 updated = [...updated, ...nextMatches];
@@ -271,14 +246,14 @@
 
                 setMatches(updated);
                 setLocalStorage('pb_matches', updated);
-                if (completed) showToast("🏆 결과가 저장되어 실시간 순위가 업데이트되었습니다!");
+                if (completed) showToast("🏆 순위보드 및 전광판이 실시간 동기화되었습니다!");
             };
 
             const updateTeamPlayers = (teamId, p1, p2) => {
                 const updated = teams.map(t => t.id === teamId ? { ...t, player1: p1, player2: p2 } : t);
                 setTeams(updated);
                 setLocalStorage('pb_teams', updated);
-                showToast("👤 선수단 정보를 실시간 업데이트했습니다.");
+                showToast("👤 선수단 등록 완료!");
             };
 
             const getRankings = (groupName) => {
@@ -309,21 +284,23 @@
                 });
             };
 
+            const currentGroup = tvScreenMode === 'A_RANK' ? 'A' : 'B';
+            const currentRankings = getRankings(currentGroup);
+
             return (
                 <div className="min-h-screen bg-slate-950 text-white flex flex-col">
                     {toast && (
-                        <div className="fixed top-5 right-5 bg-gradient-to-r from-yellow-400 to-amber-500 text-slate-950 font-black px-6 py-3 rounded-2xl shadow-2xl z-50">
+                        <div className="fixed top-5 right-5 bg-yellow-400 text-slate-950 font-black px-6 py-3 rounded-2xl shadow-2xl z-50">
                             {toast}
                         </div>
                     )}
 
-                    {/* 글로벌 네비바 */}
                     <header className="bg-slate-900 border-b border-slate-800 px-6 py-4 flex flex-col md:flex-row items-center justify-between gap-4">
                         <div className="flex items-center gap-3">
                             <span className="text-3xl">🏆</span>
                             <div>
-                                <h1 className="text-xl font-black text-yellow-400 tracking-wider">CHURCH PICKLEBALL PRO</h1>
-                                <p className="text-xs text-slate-400">교회 전용 전광판 시스템 (리그 & 토너먼트 프리미엄)</p>
+                                <h1 className="text-xl font-black text-yellow-400 tracking-wider">CHURCH PICKLEBALL STADIUM</h1>
+                                <p className="text-xs text-slate-400">교회 연합 피클볼 대회 전광판 라이브 시스템</p>
                             </div>
                         </div>
                         <nav className="flex bg-slate-950 p-1 rounded-xl border border-slate-800 text-sm font-bold">
@@ -336,146 +313,202 @@
 
                     <main className="flex-1 p-4 md:p-8 max-w-7xl w-full mx-auto">
                         
-                        {/* 1. TV 전광판 대시보드 뷰 (완전 자동 롤링 시스템) */}
+                        {/* 1. TV 전광판 대인 스크린 뷰 */}
                         {activeTab === 'tv' && (
                           <div className="space-y-6">
                             
-                            {/* 모드 수동 변경 가이드 컨트롤러 */}
+                            {/* 상단 전광판 수동 가드 바 */}
                             <div className="flex flex-wrap justify-between items-center bg-slate-900 p-4 rounded-2xl border border-slate-800 gap-2">
                                 <div className="flex gap-2">
-                                    <button onClick={() => { setTvScreenMode('A_RANK'); setAutoRotate(false); }} className={`px-4 py-2 rounded-xl font-black text-xs ${tvScreenMode === 'A_RANK' ? 'bg-yellow-400 text-slate-950' : 'bg-slate-950 text-slate-400'}`}>A조 순위판 고정</button>
-                                    <button onClick={() => { setTvScreenMode('B_RANK'); setAutoRotate(false); }} className={`px-4 py-2 rounded-xl font-black text-xs ${tvScreenMode === 'B_RANK' ? 'bg-yellow-400 text-slate-950' : 'bg-slate-950 text-slate-400'}`}>B조 순위판 고정</button>
-                                    <button onClick={() => { setTvScreenMode('LIVE_COURT'); setAutoRotate(false); }} className={`px-4 py-2 rounded-xl font-black text-xs ${tvScreenMode === 'LIVE_COURT' ? 'bg-emerald-400 text-slate-950' : 'bg-slate-950 text-slate-400'}`}>🕒 실시간 코트현황 고정</button>
+                                    <button onClick={() => { setTvScreenMode('A_RANK'); setAutoRotate(false); }} className={`px-4 py-2 rounded-xl font-black text-xs ${tvScreenMode === 'A_RANK' ? 'bg-yellow-400 text-slate-950' : 'bg-slate-950 text-slate-400'}`}>{tournamentType==='league'?'A조 순위표':'A조 토너먼트 트리'}</button>
+                                    <button onClick={() => { setTvScreenMode('B_RANK'); setAutoRotate(false); }} className={`px-4 py-2 rounded-xl font-black text-xs ${tvScreenMode === 'B_RANK' ? 'bg-yellow-400 text-slate-950' : 'bg-slate-950 text-slate-400'}`}>{tournamentType==='league'?'B조 순위표':'B조 토너먼트 트리'}</button>
+                                    <button onClick={() => { setTvScreenMode('LIVE_COURT'); setAutoRotate(false); }} className={`px-4 py-2 rounded-xl font-black text-xs ${tvScreenMode === 'LIVE_COURT' ? 'bg-emerald-400 text-slate-950' : 'bg-slate-950 text-slate-400'}`}>🕒 실시간 코트현황</button>
                                 </div>
                                 <button onClick={() => setAutoRotate(!autoRotate)} className={`text-xs px-3 py-1.5 rounded-lg font-bold border ${autoRotate ? 'border-yellow-400/50 text-yellow-400' : 'border-slate-700 text-slate-500'}`}>
-                                    {autoRotate ? '🔄 자동 화면순환 가동중 (12초 주기)' : '⏸️ 자동 화면순환 일시정지'}
+                                    {autoRotate ? '🔄 자동 전광판 화면순환 가동중 (12초)' : '⏸️ 전광판 순환 일시중지'}
                                 </button>
                             </div>
 
-                            {/* [화면분기 1 & 2] A조 및 B조 순위 테이블 */}
-                            {(tvScreenMode === 'A_RANK' || tvScreenMode === 'B_RANK') && (
-                                <div className="space-y-6 animate-fade-in">
+                            {/* [리그전 전광판 모드] */}
+                            {tournamentType === 'league' && (tvScreenMode === 'A_RANK' || tvScreenMode === 'B_RANK') && (
+                                <div className="space-y-8">
                                     <div className="text-center py-6 bg-gradient-to-r from-yellow-400/5 via-slate-900 to-yellow-400/5 rounded-3xl border border-slate-800">
-                                        <span className="bg-yellow-400 text-slate-950 text-xs font-black px-4 py-1 rounded-full uppercase tracking-widest">
-                                            {tvScreenMode === 'A_RANK' ? 'A' : 'B'}조 실시간 종합 순위 ({tournamentType === 'league' ? '리그전' : '토너먼트'})
-                                        </span>
-                                        <h2 className="text-3xl md:text-5xl font-black mt-2 tracking-tight">STANDINGS - GROUP {tvScreenMode === 'A_RANK' ? 'A' : 'B'}</h2>
+                                        <span className="bg-yellow-400 text-slate-950 text-xs font-black px-4 py-1 rounded-full uppercase tracking-widest">{currentGroup}조 실시간 리그 순위</span>
+                                        <h2 className="text-3xl md:text-5xl font-black mt-2 tracking-tight">LEAGUE STANDINGS - GROUP {currentGroup}</h2>
                                     </div>
 
-                                    {(() => {
-                                        const targetGroup = tvScreenMode === 'A_RANK' ? 'A' : 'B';
-                                        const rankings = getRankings(targetGroup);
-
-                                        if (rankings.length === 0) {
-                                            return <div className="text-center py-20 bg-slate-900 rounded-3xl text-slate-500 font-bold">생성된 대회 대진 정보가 없습니다.</div>;
-                                        }
-
-                                        return (
-                                            <div className="space-y-6">
-                                                {/* TOP 3 메달리스트 보드 */}
-                                                <div className="grid grid-cols-1 md:grid-cols-3 gap-6 items-end">
-                                                    {rankings[1] && (
-                                                        <div className="bg-slate-900 border-2 border-slate-700 rounded-3xl p-6 h-60 flex flex-col justify-between shadow-xl order-2 md:order-1">
-                                                            <div className="flex justify-between items-start"><span className="text-xs font-black text-slate-400 tracking-widest">2ND RANK</span><span className="text-2xl">🥈</span></div>
-                                                            <div>
-                                                                <div className="text-xs text-slate-500 font-black">{rankings[1].id}</div>
-                                                                <h3 className="text-xl font-black text-white">{rankings[1].name}</h3>
-                                                                <p className="text-xs text-slate-400">{rankings[1].p1 || '미등록'} & {rankings[1].p2 || '미등록'}</p>
-                                                            </div>
-                                                            <div className="border-t border-slate-800 pt-3 grid grid-cols-3 text-center text-xs font-bold">
-                                                                <div><p className="text-slate-500">전적</p><p className="text-sm font-black text-white">{rankings[1].wins}승 {rankings[1].losses}패</p></div>
-                                                                <div><p className="text-slate-500">득실차</p><p className="text-sm font-black text-amber-500">{(rankings[1].pf-rankings[1].pa) > 0 ? `+${rankings[1].pf-rankings[1].pa}` : rankings[1].pf-rankings[1].pa}</p></div>
-                                                                <div><p className="text-slate-500">총득점</p><p className="text-sm font-black text-white">{rankings[1].pf}점</p></div>
-                                                            </div>
+                                    {currentRankings.length === 0 ? (
+                                        <div className="text-center py-20 bg-slate-900 rounded-3xl text-slate-500 font-bold">생성된 경기 대진 결과가 없습니다.</div>
+                                    ) : (
+                                        <div className="space-y-10">
+                                            {/* 완벽 교정: 올림픽 시상대 입체 구조 (1등이 가운데서 독보적으로 거대하게 솟아오름!) */}
+                                            <div className="flex flex-col md:flex-row justify-center items-end gap-6 max-w-4xl mx-auto pt-10">
+                                                
+                                                {/* 🥈 2등석 (왼쪽, 중간 크기) */}
+                                                {currentRankings[1] && (
+                                                    <div className="w-full md:w-72 bg-gradient-to-b from-slate-900 to-slate-950 border-2 border-slate-700/60 rounded-3xl p-6 h-[270px] flex flex-col justify-between shadow-xl order-2 md:order-1 border-b-8 border-b-slate-400">
+                                                        <div className="flex justify-between items-start"><span className="text-xs font-black text-slate-400 tracking-widest">2ND PLACE</span><span className="text-3xl">🥈</span></div>
+                                                        <div>
+                                                            <div className="text-xs text-slate-500 font-black">{currentRankings[1].id}</div>
+                                                            <h3 className="text-xl font-black text-white">{currentRankings[1].name}</h3>
+                                                            <p className="text-xs text-slate-400">{currentRankings[1].p1 || '미등록'} & {currentRankings[1].p2 || '미등록'}</p>
                                                         </div>
-                                                    )}
-                                                    {rankings[0] && (
-                                                        <div className="bg-slate-900 border-2 border-yellow-400 rounded-3xl p-6 h-68 flex flex-col justify-between shadow-2xl shadow-yellow-400/5 order-1 md:order-2">
-                                                            <div className="flex justify-between items-start"><span className="text-xs font-black text-yellow-400 tracking-widest">CURRENT LEADER</span><span className="text-3xl">🏆</span></div>
-                                                            <div>
-                                                                <div className="text-xs text-yellow-400/70 font-black">{rankings[0].id}</div>
-                                                                <h3 className="text-2xl font-black text-white">{rankings[0].name}</h3>
-                                                                <p className="text-xs text-slate-300">{rankings[0].p1 || '미등록'} & {rankings[0].p2 || '미등록'}</p>
-                                                            </div>
-                                                            <div className="border-t border-yellow-400/20 pt-3 grid grid-cols-3 text-center text-xs font-bold">
-                                                                <div><p className="text-yellow-400/60">전적</p><p className="text-base font-black text-yellow-400">{rankings[0].wins}승 {rankings[0].losses}패</p></div>
-                                                                <div><p className="text-yellow-400/60">득실차</p><p className="text-base font-black text-amber-500">{(rankings[0].pf-rankings[0].pa) > 0 ? `+${rankings[0].pf-rankings[0].pa}` : rankings[0].pf-rankings[0].pa}</p></div>
-                                                                <div><p className="text-yellow-400/60">총득점</p><p className="text-base font-black text-white">{rankings[0].pf}점</p></div>
-                                                            </div>
+                                                        <div className="border-t border-slate-800 pt-3 flex justify-between text-center text-xs font-bold">
+                                                            <div><p className="text-slate-500 text-[10px]">전적</p><p className="text-sm font-black text-white">{currentRankings[1].wins}승 {currentRankings[1].losses}패</p></div>
+                                                            <div><p className="text-slate-500 text-[10px]">득실차</p><p className="text-sm font-black text-amber-500">{(currentRankings[1].pf-currentRankings[1].pa) > 0 ? `+${currentRankings[1].pf-currentRankings[1].pa}` : currentRankings[1].pf-currentRankings[1].pa}</p></div>
+                                                            <div><p className="text-slate-500 text-[10px]">총득점</p><p className="text-sm font-black text-white">{currentRankings[1].pf}점</p></div>
                                                         </div>
-                                                    )}
-                                                    {rankings[2] && (
-                                                        <div className="bg-slate-900 border-2 border-amber-800 rounded-3xl p-6 h-60 flex flex-col justify-between shadow-xl order-3">
-                                                            <div className="flex justify-between items-start"><span className="text-xs font-black text-amber-600 tracking-widest">3RD RANK</span><span className="text-2xl">🥉</span></div>
-                                                            <div>
-                                                                <div className="text-xs text-slate-500 font-black">{rankings[2].id}</div>
-                                                                <h3 className="text-xl font-black text-white">{rankings[2].name}</h3>
-                                                                <p className="text-xs text-slate-400">{rankings[2].p1 || '미등록'} & {rankings[2].p2 || '미등록'}</p>
-                                                            </div>
-                                                            <div className="border-t border-slate-800 pt-3 grid grid-cols-3 text-center text-xs font-bold">
-                                                                <div><p className="text-slate-500">전적</p><p className="text-sm font-black text-white">{rankings[2].wins}승 {rankings[2].losses}패</p></div>
-                                                                <div><p className="text-slate-500">득실차</p><p className="text-sm font-black text-amber-500">{(rankings[2].pf-rankings[2].pa) > 0 ? `+${rankings[2].pf-rankings[2].pa}` : rankings[2].pf-rankings[2].pa}</p></div>
-                                                                <div><p className="text-slate-500">총득점</p><p className="text-sm font-black text-white">{rankings[2].pf}점</p></div>
-                                                            </div>
-                                                        </div>
-                                                    )}
-                                                </div>
+                                                    </div>
+                                                )}
 
-                                                {/* 전체 스코어 그리드 리스트 */}
-                                                <div className="bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden">
-                                                    <table className="w-full text-left border-collapse">
-                                                        <thead>
-                                                            <tr className="bg-slate-950 text-slate-400 text-xs font-bold border-b border-slate-800">
-                                                                <th className="p-4 text-center">순위</th>
-                                                                <th className="p-4">팀코드/팀명</th>
-                                                                <th className="p-4">출전 복식조 선수명</th>
-                                                                <th className="p-4 text-center">경기수</th>
-                                                                <th className="p-4 text-center text-emerald-400">승</th>
-                                                                <th className="p-4 text-center text-rose-400">패</th>
-                                                                <th className="p-4 text-center text-amber-500">득실차</th>
-                                                                <th className="p-4 text-center">총득점</th>
-                                                            </tr>
-                                                        </thead>
-                                                        <tbody className="divide-y divide-slate-800/50 text-sm">
-                                                            {rankings.map((t, idx) => (
-                                                                <tr key={t.id} className="hover:bg-slate-800/10">
-                                                                    <td className="p-4 text-center font-black text-slate-400">{idx + 1}위</td>
-                                                                    <td className="p-4 font-bold text-white"><span className="text-xs bg-slate-950 px-2 py-0.5 rounded text-slate-400 mr-2">{t.id}</span>{t.name}</td>
-                                                                    <td className="p-4 text-slate-300">{(t.p1 || t.p2) ? `${t.p1} & ${t.p2}` : <span className="text-slate-600 text-xs">선수 미지정</span>}</td>
-                                                                    <td className="p-4 text-center text-slate-400 font-bold">{t.played}</td>
-                                                                    <td className="p-4 text-center font-black text-emerald-400">{t.wins}</td>
-                                                                    <td className="p-4 text-center font-black text-rose-400">{t.losses}</td>
-                                                                    <td className="p-4 text-center font-black text-amber-500">{(t.pf-t.pa) > 0 ? `+${t.pf-t.pa}` : t.pf-t.pa}</td>
-                                                                    <td className="p-4 text-center font-black text-slate-200">{t.pf}점</td>
-                                                                </tr>
-                                                            ))}
-                                                        </tbody>
-                                                    </table>
-                                                </div>
+                                                {/* 👑 1등석 (가운데 배치, 가장 크고 웅장하며 위로 상승 팝업!) */}
+                                                {currentRankings[0] && (
+                                                    <div className="w-full md:w-80 bg-gradient-to-b from-slate-900 to-slate-950 border-4 border-yellow-400 rounded-3xl p-6 h-[350px] flex flex-col justify-between shadow-2xl shadow-yellow-400/20 order-1 md:order-2 transform md:-translate-y-6 relative overflow-hidden border-b-[12px] border-b-yellow-400">
+                                                        <div className="absolute top-0 right-0 w-24 h-24 bg-yellow-400/10 rounded-full -mr-6 -mt-6 blur-xl animate-pulse"></div>
+                                                        <div className="flex justify-between items-start"><span className="text-xs font-black text-yellow-400 tracking-widest">👑 CURRENT LEADER</span><span className="text-5xl">🏆</span></div>
+                                                        <div className="space-y-1 py-4">
+                                                            <div className="text-sm text-yellow-400 font-black">{currentRankings[0].id}</div>
+                                                            <h3 className="text-3xl font-black text-white tracking-tight">{currentRankings[0].name}</h3>
+                                                            <p className="text-sm text-yellow-200/70 font-semibold">{currentRankings[0].p1 || '미등록'} & {currentRankings[0].p2 || '미등록'}</p>
+                                                        </div>
+                                                        <div className="border-t border-yellow-400/20 pt-4 flex justify-between text-center text-xs font-bold bg-yellow-400/5 p-3 rounded-xl">
+                                                            <div><p className="text-yellow-400/60">승패</p><p className="text-lg font-black text-yellow-400">{currentRankings[0].wins}승 {currentRankings[0].losses}패</p></div>
+                                                            <div><p className="text-yellow-400/60">득실차</p><p className="text-lg font-black text-amber-500">{(currentRankings[0].pf-currentRankings[0].pa) > 0 ? `+${currentRankings[0].pf-currentRankings[0].pa}` : currentRankings[0].pf-currentRankings[0].pa}</p></div>
+                                                            <div><p className="text-yellow-400/60">총점</p><p className="text-lg font-black text-white">{currentRankings[0].pf}점</p></div>
+                                                        </div>
+                                                    </div>
+                                                )}
+
+                                                {/* 🥉 3등석 (오른쪽, 가장 낮고 컴팩트하게 조율) */}
+                                                {currentRankings[2] && (
+                                                    <div className="w-full md:w-72 bg-gradient-to-b from-slate-900 to-slate-950 border-2 border-amber-800/60 rounded-3xl p-6 h-[220px] flex flex-col justify-between shadow-xl order-3 border-b-6 border-b-amber-700">
+                                                        <div className="flex justify-between items-start"><span className="text-xs font-black text-amber-600 tracking-widest">3RD PLACE</span><span className="text-2xl">🥉</span></div>
+                                                        <div>
+                                                            <div className="text-xs text-slate-500 font-black">{currentRankings[2].id}</div>
+                                                            <h3 className="text-xl font-black text-white">{currentRankings[2].name}</h3>
+                                                            <p className="text-xs text-slate-400">{currentRankings[2].p1 || '미등록'} & {currentRankings[2].p2 || '미등록'}</p>
+                                                        </div>
+                                                        <div className="border-t border-slate-800 pt-2 flex justify-between text-center text-xs font-bold">
+                                                            <div><p className="text-slate-500 text-[10px]">전적</p><p className="text-sm font-black text-white">{currentRankings[2].wins}승 {currentRankings[2].losses}패</p></div>
+                                                            <div><p className="text-slate-500 text-[10px]">득실차</p><p className="text-sm font-black text-amber-500">{(currentRankings[2].pf-currentRankings[2].pa) > 0 ? `+${currentRankings[2].pf-currentRankings[2].pa}` : currentRankings[2].pf-currentRankings[2].pa}</p></div>
+                                                            <div><p className="text-slate-500 text-[10px]">총점</p><p className="text-sm font-black text-white">{currentRankings[2].pf}점</p></div>
+                                                        </div>
+                                                    </div>
+                                                )}
                                             </div>
-                                        );
-                                    })()}
+
+                                            {/* 하단 전체 리그 스코어 테이블 */}
+                                            <div className="bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden shadow-2xl">
+                                                <table className="w-full text-left border-collapse">
+                                                    <thead>
+                                                        <tr className="bg-slate-950 text-slate-400 text-xs font-bold uppercase border-b border-slate-800">
+                                                            <th className="p-4 text-center">순위</th>
+                                                            <th className="p-4">팀코드/명</th>
+                                                            <th className="p-4">복식조 명단</th>
+                                                            <th className="p-4 text-center">경기수</th>
+                                                            <th className="p-4 text-center text-emerald-400">승</th>
+                                                            <th className="p-4 text-center text-rose-400">패</th>
+                                                            <th className="p-4 text-center text-amber-500">득실차</th>
+                                                            <th className="p-4 text-center">총득점</th>
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody className="divide-y divide-slate-800/50 text-sm">
+                                                        {currentRankings.map((t, idx) => (
+                                                            <tr key={t.id} className="hover:bg-slate-800/10">
+                                                                <td className="p-4 text-center font-black text-slate-400">{idx + 1}위</td>
+                                                                <td className="p-4 font-bold text-white"><span className="text-xs bg-slate-950 px-2 py-0.5 rounded text-slate-400 mr-2">{t.id}</span>{t.name}</td>
+                                                                <td className="p-4 text-slate-300">{(t.p1 || t.p2) ? `${t.p1} & ${t.p2}` : <span className="text-slate-600 text-xs">선수 미지정</span>}</td>
+                                                                <td className="p-4 text-center text-slate-400 font-bold">{t.played}</td>
+                                                                <td className="p-4 text-center font-black text-emerald-400">{t.wins}</td>
+                                                                <td className="p-4 text-center font-black text-rose-400">{t.losses}</td>
+                                                                <td className="p-4 text-center font-black text-amber-500">{(t.pf-t.pa) > 0 ? `+${t.pf-t.pa}` : t.pf-t.pa}</td>
+                                                                <td className="p-4 text-center font-black text-slate-200">{t.pf}점</td>
+                                                            </tr>
+                                                        ))}
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        </div>
+                                    )}
                                 </div>
                             )}
 
-                            {/* [화면분기 3] 🕒 실시간 코트 배정 및 대진 현황판 (핵심 해결책!) */}
+                            {/* [완전 새기능: 토너먼트 가시적 그래픽 트리 대진표 뷰] */}
+                            {tournamentType === 'tournament' && (tvScreenMode === 'A_RANK' || tvScreenMode === 'B_RANK') && (
+                                <div className="space-y-6 animate-fade-in">
+                                    <div className="text-center py-6 bg-gradient-to-r from-blue-500/5 via-slate-900 to-blue-500/5 rounded-3xl border border-slate-800">
+                                        <span className="bg-blue-500 text-white text-xs font-black px-4 py-1 rounded-full uppercase tracking-widest">{currentGroup}조 실시간 토너먼트 맵</span>
+                                        <h2 className="text-3xl md:text-5xl font-black mt-2 tracking-tight">TOURNAMENT BRACKET ({currentGroup})</h2>
+                                    </div>
+
+                                    {/* 가로 스크롤 구조의 비주얼 트리 브래킷 맵 */}
+                                    <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 overflow-x-auto shadow-2xl flex justify-start gap-12 min-h-[400px] items-center">
+                                        {(() => {
+                                            const groupMatches = matches.filter(m => m.group === currentGroup);
+                                            const rounds = ["토너먼트 1R", "토너먼트 2R", "🏅 4강 준결승", "🥇 최종 결승전"];
+                                            
+                                            // 매치들이 존재하는 라운드만 모아서 컬럼화
+                                            const activeRounds = rounds.filter(r => groupMatches.some(m => m.roundName === r));
+
+                                            if (groupMatches.length === 0) {
+                                                return <div className="text-center w-full text-slate-500 font-bold py-10">대진표 세팅 탭에서 토너먼트를 먼저 빌드해주세요!</div>;
+                                            }
+
+                                            return activeRounds.map((roundName, rIdx) => {
+                                                const roundMatches = groupMatches.filter(m => m.roundName === roundName);
+                                                return (
+                                                    <div key={roundName} className="flex flex-col gap-6 min-w-[240px] items-center justify-center">
+                                                        <div className="text-xs font-black bg-slate-950 px-3 py-1.5 rounded-xl border border-slate-800 text-yellow-400 tracking-wider w-full text-center uppercase shadow-md">
+                                                            {roundName}
+                                                        </div>
+                                                        <div className="flex flex-col justify-around h-full gap-8 w-full">
+                                                            {roundMatches.map(m => {
+                                                                const w1 = m.completed && m.score1 > m.score2;
+                                                                const w2 = m.completed && m.score2 > m.score1;
+                                                                return (
+                                                                    <div key={m.id} className="bg-slate-950 border border-slate-800 p-3 rounded-2xl shadow-lg space-y-2 relative border-l-4 border-l-blue-500">
+                                                                        <div className="text-[10px] font-black text-slate-500 flex justify-between">
+                                                                            <span>{m.court}</span>
+                                                                            <span>{m.time}</span>
+                                                                        </div>
+                                                                        {/* 팀 1 슬롯 */}
+                                                                        <div className={`flex justify-between items-center text-xs p-1.5 rounded-lg font-bold ${w1 ? 'bg-yellow-400/10 text-yellow-400' : 'text-slate-300'}`}>
+                                                                            <span className="truncate max-w-[140px]">{m.team1Id}팀</span>
+                                                                            <span className="font-black font-mono text-sm">{m.score1 !== null ? m.score1 : '-'}</span>
+                                                                        </div>
+                                                                        {/* 팀 2 슬롯 */}
+                                                                        <div className={`flex justify-between items-center text-xs p-1.5 rounded-lg font-bold ${w2 ? 'bg-yellow-400/10 text-yellow-400' : 'text-slate-300'}`}>
+                                                                            <span className="truncate max-w-[140px]">{m.team2Id}팀</span>
+                                                                            <span className="font-black font-mono text-sm">{m.score2 !== null ? m.score2 : '-'}</span>
+                                                                        </div>
+                                                                    </div>
+                                                                );
+                                                            })}
+                                                        </div>
+                                                    </div>
+                                                );
+                                            });
+                                        })()}
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* [화면분기 3] 🕒 실시간 코트 현황판 */}
                             {tvScreenMode === 'LIVE_COURT' && (
                                 <div className="space-y-6 animate-fade-in">
                                     <div className="text-center py-6 bg-gradient-to-r from-emerald-500/5 via-slate-900 to-emerald-500/5 rounded-3xl border border-slate-800">
-                                        <span className="bg-emerald-400 text-slate-950 text-xs font-black px-4 py-1 rounded-full uppercase tracking-widest">LIVE COURT STATUS</span>
-                                        <h2 className="text-3xl md:text-5xl font-black mt-2 tracking-tight">실시간 코트별 매치 현황</h2>
-                                        <p className="text-xs text-slate-400 mt-1">현재 각 코트에서 열리는 경기와 다음 대기 팀 목록입니다.</p>
+                                        <span className="bg-emerald-400 text-slate-950 text-xs font-black px-4 py-1 rounded-full uppercase tracking-widest">LIVE COURT MONITOR</span>
+                                        <h2 className="text-3xl md:text-5xl font-black mt-2 tracking-tight">실시간 코트별 현재 경기 상황</h2>
                                     </div>
 
                                     <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                                        {/* 1, 2, 3코트별로 활성화된 매치와 다음 매치를 분리수거하여 노출 */}
                                         {[1, 2, 3].map(courtNum => {
                                             const courtName = `${courtNum}코트`;
                                             const courtMatches = matches.filter(m => m.court === courtName);
                                             const currentMatch = courtMatches.find(m => !m.completed);
                                             const nextMatch = courtMatches.filter(m => !m.completed)[1];
 
-                                            const getTeamNames = (id) => {
+                                            const getTeamFullInfo = (id) => {
                                                 const t = teams.find(team => team.id === id);
                                                 return t ? `${t.name} (${t.player1 || '미정'}, ${t.player2 || '미정'})` : id;
                                             };
@@ -485,20 +518,18 @@
                                                     <div className="flex justify-between items-center border-b border-slate-800 pb-3">
                                                         <h3 className="text-2xl font-black text-yellow-400">{courtName}</h3>
                                                         <span className={`text-xs font-black px-2.5 py-1 rounded-full ${currentMatch ? 'bg-emerald-500/10 text-emerald-400 animate-pulse' : 'bg-slate-950 text-slate-500'}`}>
-                                                            {currentMatch ? 'MATCH LIVE' : '대기중'}
+                                                            {currentMatch ? '경기 진행중' : '대기중'}
                                                         </span>
                                                     </div>
 
-                                                    {/* 현재 진행 경기 정보 */}
                                                     <div className="space-y-3 py-2 flex-1">
-                                                        <p className="text-[11px] font-bold text-slate-500 tracking-wider uppercase">NOW PLAYING</p>
+                                                        <p className="text-[10px] font-black text-slate-500 tracking-widest uppercase">NOW PLAYING</p>
                                                         {currentMatch ? (
-                                                            <div className="bg-slate-950 p-4 rounded-2xl border border-slate-800 space-y-2">
+                                                            <div className="bg-slate-950 p-4 rounded-2xl border border-slate-800/80 space-y-2">
                                                                 <div className="text-xs font-bold text-yellow-400/80 mb-1">[{currentMatch.group}조] {currentMatch.roundName} - {currentMatch.time}</div>
-                                                                <div className="text-sm font-black text-white truncate">{getTeamNames(currentMatch.team1Id)}</div>
+                                                                <div className="text-sm font-black text-white truncate">{getTeamFullInfo(currentMatch.team1Id)}</div>
                                                                 <div className="text-xs font-extrabold text-slate-600 my-0.5">VS</div>
-                                                                <div className="text-sm font-black text-white truncate">{getTeamNames(currentMatch.team2Id)}</div>
-                                                                {/* 진행중인 실시간 스코어 서포트 */}
+                                                                <div className="text-sm font-black text-white truncate">{getTeamFullInfo(currentMatch.team2Id)}</div>
                                                                 <div className="pt-2 text-center text-xl font-black text-yellow-400 bg-slate-900/50 rounded-xl mt-2 py-1">
                                                                     {currentMatch.score1 || 0} : {currentMatch.score2 || 0}
                                                                 </div>
@@ -508,16 +539,15 @@
                                                         )}
                                                     </div>
 
-                                                    {/* 다음 대기 경기 정보 */}
                                                     <div className="border-t border-slate-800/60 pt-4 space-y-2">
-                                                        <p className="text-[10px] font-bold text-slate-500 tracking-wider uppercase">NEXT MATCH</p>
+                                                        <p className="text-[10px] font-black text-slate-500 tracking-widest uppercase">NEXT MATCH</p>
                                                         {nextMatch ? (
                                                             <div className="text-xs text-slate-400 font-bold flex items-center justify-between">
                                                                 <span className="truncate max-w-[80%]">👉 {nextMatch.team1Id} vs {nextMatch.team2Id} ({nextMatch.roundName})</span>
                                                                 <span className="text-slate-500 text-[10px]">{nextMatch.time}</span>
                                                             </div>
                                                         ) : (
-                                                            <p className="text-[11px] font-bold text-slate-600">다음 대기 경기 없음</p>
+                                                            <p className="text-[11px] font-bold text-slate-600">다음 대기팀 없음</p>
                                                         )}
                                                     </div>
                                                 </div>
@@ -530,7 +560,7 @@
                           </div>
                         )}
 
-                        {/* 2. 모바일 iPhone 점수 컨트롤 패널 */}
+                        {/* 2. 모바일 iPhone 점수 컨트롤러 패널 */}
                         {activeTab === 'admin' && (
                             <div className="max-w-xl mx-auto space-y-4">
                                 <div className="flex gap-2 bg-slate-900 p-1.5 rounded-2xl border border-slate-800">
@@ -539,7 +569,7 @@
                                 </div>
 
                                 {matches.filter(m => m.group === selectedGroup).length === 0 ? (
-                                    <div className="text-center py-12 text-slate-500 font-bold">생성된 경기 대진표가 없습니다. [대진표 세팅]을 완료해주세요!</div>
+                                    <div className="text-center py-12 text-slate-500 font-bold">대진표 세팅 탭에서 먼저 대진표를 빌드해 주세요.</div>
                                 ) : (
                                     <div className="space-y-4">
                                         {matches.filter(m => m.group === selectedGroup).map(m => {
@@ -556,7 +586,7 @@
                                                         <span className={m.completed ? 'text-emerald-400' : 'text-amber-400'}>{m.completed ? '● 확정됨' : '○ 진행중'}</span>
                                                     </div>
                                                     <div className="grid grid-cols-7 items-center text-center">
-                                                        {/* 팀 1 조작 패드 */}
+                                                        {/* 팀 1 */}
                                                         <div className="col-span-3 space-y-1">
                                                             <div className="text-xs text-slate-500 font-black">{m.team1Id}</div>
                                                             <div className="font-bold text-sm text-white truncate">{t1?.name}</div>
@@ -575,7 +605,7 @@
 
                                                         <div className="col-span-1 text-xs font-black text-slate-600">VS</div>
 
-                                                        {/* 팀 2 조작 패드 */}
+                                                        {/* 팀 2 */}
                                                         <div className="col-span-3 space-y-1">
                                                             <div className="text-xs text-slate-500 font-black">{m.team2Id}</div>
                                                             <div className="font-bold text-sm text-white truncate">{t2?.name}</div>
@@ -594,19 +624,19 @@
                                                     </div>
                                                     <div className="pt-2 border-t border-slate-800/50">
                                                         {m.completed ? (
-                                                            <button onClick={() => saveScore(m.id, m.score1, m.score2, false)} className="w-full py-1.5 bg-slate-950 text-slate-400 text-xs font-bold rounded-xl border border-slate-800">🔓 결과 잠금해제 및 재수정</button>
+                                                            <button onClick={() => saveScore(m.id, m.score1, m.score2, false)} className="w-full py-1.5 bg-slate-950 text-slate-400 text-xs font-bold rounded-xl border border-slate-800">🔓 잠금해제 및 스코어 재수정</button>
                                                         ) : (
                                                             <button 
                                                                 onClick={() => {
                                                                     if (s1 < 11 && s2 < 11) {
-                                                                        alert("⚠️ 피클볼 스코어 마감 오류!\n최소 한 팀은 11점 고지에 도달해야만 경기를 끝낼 수 있습니다.");
+                                                                        alert("⚠️ 피클볼 스코어 가드 시스템 가동!\n한 팀이라도 11점 이상 득점해야 정상 종료 마감이 가능합니다.");
                                                                         return;
                                                                     }
                                                                     saveScore(m.id, s1, s2, true);
                                                                 }} 
                                                                 className="w-full py-2 bg-emerald-500 text-slate-950 text-xs font-black rounded-xl shadow-lg"
                                                             >
-                                                                경기 마감 및 스코어 락 걸기 🔒
+                                                                경기 종료 및 스코어 락 걸기 🔒
                                                             </button>
                                                         )}
                                                     </div>
@@ -618,115 +648,4 @@
                             </div>
                         )}
 
-                        {/* 3. 복식조 선수단 명단 편집 뷰 */}
-                        {activeTab === 'teams' && (
-                            <div className="max-w-2xl mx-auto space-y-4">
-                                <div className="flex gap-2 bg-slate-900 p-1.5 rounded-2xl border border-slate-800">
-                                    <button onClick={() => setSelectedGroup('A')} className={`flex-1 py-2.5 text-center rounded-xl font-black text-sm transition-all ${selectedGroup === 'A' ? 'bg-yellow-400 text-slate-950' : 'text-slate-400'}`}>A조 명단 ({numTeamsA}팀)</button>
-                                    <button onClick={() => setSelectedGroup('B')} className={`flex-1 py-2.5 text-center rounded-xl font-black text-sm transition-all ${selectedGroup === 'B' ? 'bg-yellow-400 text-slate-950' : 'text-slate-400'}`}>B조 명단 ({numTeamsB}팀)</button>
-                                </div>
-                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                                    {teams.filter(t => t.group === selectedGroup).map(t => (
-                                        <div key={t.id} className="bg-slate-900 border border-slate-800 p-4 rounded-2xl space-y-3">
-                                            <div className="flex items-center gap-2"><span className="text-xs bg-slate-950 px-2 py-0.5 rounded text-yellow-400 font-black">{t.id}</span><span className="font-bold text-sm">{t.name}</span></div>
-                                            <div className="grid grid-cols-2 gap-2">
-                                                <input type="text" value={t.player1} onChange={(e) => updateTeamPlayers(t.id, e.target.value, t.player2)} className="bg-slate-950 border border-slate-800 px-3 py-1.5 rounded-xl text-xs font-bold text-white focus:border-yellow-400 focus:outline-none" placeholder="선수 1 이름"/>
-                                                <input type="text" value={t.player2} onChange={(e) => updateTeamPlayers(t.id, t.player1, e.target.value)} className="bg-slate-950 border border-slate-800 px-3 py-1.5 rounded-xl text-xs font-bold text-white focus:border-yellow-400 focus:outline-none" placeholder="선수 2 이름"/>
-                                            </div>
-                                        </div>
-                                    ))}
-                                </div>
-                            </div>
-                        )}
-
-                        {/* 4. 최첨단 커스텀 대진 조율 제너레이터 탭 */}
-                        {activeTab === 'schedule' && (
-                            <div className="max-w-xl mx-auto space-y-6">
-                                <div className="bg-slate-900 border border-slate-800 p-6 rounded-3xl space-y-6 shadow-xl">
-                                    <div className="text-center">
-                                        <h3 className="text-lg font-black text-white">⚙️ 스마트 경기 시스템 환경설정</h3>
-                                        <p className="text-[11px] text-slate-400">대회 방식(리그/토너먼트) 및 팀 수를 정밀 제어합니다.</p>
-                                    </div>
-                                    
-                                    <div className="border-t border-slate-800 pt-4 space-y-5">
-                                        {/* 핵심 피드백: 리그전 vs 토너먼트 선택 스위치 패널 */}
-                                        <div className="space-y-2">
-                                            <label className="text-xs font-black text-slate-400 uppercase tracking-wider block">🏆 대회 대진 시스템 방식 선택</label>
-                                            <div className="grid grid-cols-2 gap-2 bg-slate-950 p-1 rounded-2xl border border-slate-800">
-                                                <button onClick={() => setTournamentType('league')} className={`py-3 rounded-xl font-black text-sm transition-all ${tournamentType === 'league' ? 'bg-yellow-400 text-slate-950 shadow-md' : 'text-slate-400'}`}>
-                                                    풀 리그전 모드 (League)
-                                                </button>
-                                                <button onClick={() => setTournamentType('tournament')} className={`py-3 rounded-xl font-black text-sm transition-all ${tournamentType === 'tournament' ? 'bg-yellow-400 text-slate-950 shadow-md' : 'text-slate-400'}`}>
-                                                    단판 토너먼트 모드 (Tournament)
-                                                </button>
-                                            </div>
-                                        </div>
-
-                                        {/* A조 동적 조건 제어판 */}
-                                        <div className="p-4 bg-slate-950 border border-slate-800 rounded-2xl space-y-3">
-                                            <h4 className="text-xs font-black text-yellow-400 uppercase tracking-wider">🅰️ A조 경기 조건 세팅</h4>
-                                            <div className="grid grid-cols-2 gap-4">
-                                                <div className="space-y-1">
-                                                    <label className="text-[11px] text-slate-400 block">A조 참여 팀수</label>
-                                                    <input type="number" min="2" max="30" value={numTeamsA} onChange={(e) => setNumTeamsA(Number(e.target.value))} className="w-full bg-slate-900 border border-slate-800 p-2 text-sm rounded-xl text-white text-center font-bold" />
-                                                </div>
-                                                <div className="space-y-1">
-                                                    <label className="text-[11px] text-slate-400 block">팀당 제한 경기수 (리그전용)</label>
-                                                    <input type="number" disabled={tournamentType==='tournament'} min="1" max={numTeamsA} value={maxGamesA} onChange={(e) => setMaxGamesA(Number(e.target.value))} className="w-full bg-slate-900 border border-slate-800 p-2 text-sm rounded-xl text-white text-center font-bold disabled:opacity-30" />
-                                                </div>
-                                            </div>
-                                        </div>
-
-                                        {/* B조 동적 조건 제어판 */}
-                                        <div className="p-4 bg-slate-950 border border-slate-800 rounded-2xl space-y-3">
-                                            <h4 className="text-xs font-black text-yellow-400 uppercase tracking-wider">🅱️ B조 경기 조건 세팅</h4>
-                                            <div className="grid grid-cols-2 gap-4">
-                                                <div className="space-y-1">
-                                                    <label className="text-[11px] text-slate-400 block">B조 참여 팀수</label>
-                                                    <input type="number" min="2" max="30" value={numTeamsB} onChange={(e) => setNumTeamsB(Number(e.target.value))} className="w-full bg-slate-900 border border-slate-800 p-2 text-sm rounded-xl text-white text-center font-bold" />
-                                                </div>
-                                                <div className="space-y-1">
-                                                    <label className="text-[11px] text-slate-400 block">팀당 제한 경기수 (리그전용)</label>
-                                                    <input type="number" disabled={tournamentType==='tournament'} min="1" max={numTeamsB} value={maxGamesB} onChange={(e) => setMaxGamesB(Number(e.target.value))} className="w-full bg-slate-900 border border-slate-800 p-2 text-sm rounded-xl text-white text-center font-bold disabled:opacity-30" />
-                                                </div>
-                                            </div>
-                                        </div>
-
-                                        {/* 하드웨어 및 기본 시간 조건표 */}
-                                        <div className="grid grid-cols-2 gap-3 text-xs font-bold text-slate-400">
-                                            <div className="space-y-1 col-span-2">
-                                                <label>가동할 피클볼 코트 수</label>
-                                                <select value={numCourts} onChange={(e) => setNumCourts(Number(e.target.value))} className="w-full bg-slate-950 border border-slate-800 p-2.5 rounded-xl text-white">
-                                                    <option value={1}>1개 코트 운영</option>
-                                                    <option value={2}>2개 코트 배치</option>
-                                                    <option value={3}>3개 코트 가동</option>
-                                                    <option value={4}>4개 코트 가동</option>
-                                                </select>
-                                            </div>
-                                            <div className="space-y-1">
-                                                <label>대회 개시 시각</label>
-                                                <input type="time" value={startTime} onChange={(e) => setStartTime(e.target.value)} className="w-full bg-slate-950 border border-slate-800 p-2 rounded-xl text-white text-center font-bold"/>
-                                            </div>
-                                            <div className="space-y-1">
-                                                <label>경기 순연 주기 (분)</label>
-                                                <input type="number" value={gameDuration} onChange={(e) => setGameDuration(e.target.value)} className="w-full bg-slate-950 border border-slate-800 p-2 rounded-xl text-white text-center"/>
-                                            </div>
-                                        </div>
-                                    </div>
-
-                                    <button onClick={handleGenerateSchedule} className="w-full py-4 bg-gradient-to-r from-yellow-400 to-amber-500 text-slate-950 font-black rounded-2xl text-sm shadow-xl active:scale-[0.99] transition-all">
-                                        🚀 지정 조건에 최적화된 스마트 대진표 즉시 생성
-                                    </button>
-                                </div>
-                            </div>
-                        )}
-                    </main>
-                </div>
-            );
-        }
-
-        const root = ReactDOM.createRoot(document.getElementById('root'));
-        root.render(<App />);
-    </script>
-</body>
-</html>
+                        {/* 3. 복식 명단 편집 뷰 */}
