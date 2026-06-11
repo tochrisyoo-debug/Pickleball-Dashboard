@@ -11,6 +11,8 @@
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
     <!-- Babel Standalone for inline JSX -->
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Supabase JS Client for Realtime syncing -->
+    <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Pretendard:wght@400;600;800;900&display=swap');
         body { 
@@ -52,7 +54,11 @@
         // --- Core Helpers & LocalStorage Utilities ---
         const getLocalStorage = (key, defaultVal) => {
             const saved = localStorage.getItem(key);
-            return saved ? JSON.parse(saved) : defaultVal;
+            try {
+                return saved ? JSON.parse(saved) : defaultVal;
+            } catch (e) {
+                return defaultVal;
+            }
         };
 
         const setLocalStorage = (key, val) => {
@@ -87,6 +93,11 @@
             const [autoRotate, setAutoRotate] = useState(true);
             const [toast, setToast] = useState(null);
 
+            // Supabase API Integration Keys
+            const [supabaseUrl, setSupabaseUrl] = useState(() => getLocalStorage('pb_supabase_url', ''));
+            const [supabaseKey, setSupabaseKey] = useState(() => getLocalStorage('pb_supabase_key', ''));
+            const [supabaseClient, setSupabaseClient] = useState(null);
+
             // Competition Options
             const [tournamentType, setTournamentType] = useState(() => getLocalStorage('pb_type', 'tournament'));
             const [numTeamsA, setNumTeamsA] = useState(() => getLocalStorage('pb_numTeamsA', 8));
@@ -103,7 +114,178 @@
             const [teams, setTeams] = useState(() => getLocalStorage('pb_teams', buildInitialTeams(8, 9)));
             const [matches, setMatches] = useState(() => getLocalStorage('pb_matches', []));
 
-            // Setup Storage Syncing
+            // --- Hoisted Global Toast Helper ---
+            function showToast(msg, isError = false) {
+                setToast({ text: msg, isError });
+                setTimeout(() => setToast(null), 3000);
+            }
+
+            // Helper to get formatted player names (Resolves team name duplication completely)
+            const getPlayersString = (teamId) => {
+                if (!teamId || teamId === 'BYE' || teamId.startsWith('WAIT_')) return '';
+                const team = teams.find(t => t.id === teamId);
+                if (!team) return '선수명 미입력';
+                const p1 = team.player1;
+                const p2 = team.player2;
+                if (p1 || p2) {
+                    return [p1, p2].filter(Boolean).join(', ');
+                }
+                return '선수명 미입력';
+            };
+
+            // Initialize Supabase Client on URL / Key change
+            useEffect(() => {
+                if (supabaseUrl && supabaseKey) {
+                    try {
+                        const client = supabase.createClient(supabaseUrl, supabaseKey);
+                        setSupabaseClient(client);
+                    } catch (e) {
+                        console.error("Supabase Initialization Error", e);
+                        setSupabaseClient(null);
+                    }
+                } else {
+                    setSupabaseClient(null);
+                }
+            }, [supabaseUrl, supabaseKey]);
+
+            // Unified State Broadcaster & Saver Helper
+            const broadcastAndSave = (updatedTeams, updatedMatches, configs = {}) => {
+                setTeams(updatedTeams);
+                setMatches(updatedMatches);
+                setLocalStorage('pb_teams', updatedTeams);
+                setLocalStorage('pb_matches', updatedMatches);
+
+                if (configs.tournamentType !== undefined) {
+                    setTournamentType(configs.tournamentType);
+                    setLocalStorage('pb_type', configs.tournamentType);
+                }
+                if (configs.numTeamsA !== undefined) {
+                    setNumTeamsA(configs.numTeamsA);
+                    setLocalStorage('pb_numTeamsA', configs.numTeamsA);
+                }
+                if (configs.numTeamsB !== undefined) {
+                    setNumTeamsB(configs.numTeamsB);
+                    setLocalStorage('pb_numTeamsB', configs.numTeamsB);
+                }
+                if (configs.maxGamesA !== undefined) {
+                    setMaxGamesA(configs.maxGamesA);
+                    setLocalStorage('pb_maxGamesA', configs.maxGamesA);
+                }
+                if (configs.maxGamesB !== undefined) {
+                    setMaxGamesB(configs.maxGamesB);
+                    setLocalStorage('pb_maxGamesB', configs.maxGamesB);
+                }
+                if (configs.numCourts !== undefined) setNumCourts(configs.numCourts);
+                if (configs.startTime !== undefined) setStartTime(configs.startTime);
+                if (configs.gameDuration !== undefined) setGameDuration(configs.gameDuration);
+                if (configs.breakDuration !== undefined) setBreakDuration(configs.breakDuration);
+
+                if (supabaseClient) {
+                    const channel = supabaseClient.channel('pb-realtime-sync');
+                    channel.send({
+                        type: 'broadcast',
+                        event: 'state-sync',
+                        payload: {
+                            teams: updatedTeams,
+                            matches: updatedMatches,
+                            tournamentType: configs.tournamentType !== undefined ? configs.tournamentType : tournamentType,
+                            numTeamsA: configs.numTeamsA !== undefined ? configs.numTeamsA : numTeamsA,
+                            numTeamsB: configs.numTeamsB !== undefined ? configs.numTeamsB : numTeamsB,
+                            maxGamesA: configs.maxGamesA !== undefined ? configs.maxGamesA : maxGamesA,
+                            maxGamesB: configs.maxGamesB !== undefined ? configs.maxGamesB : maxGamesB,
+                            numCourts: configs.numCourts !== undefined ? configs.numCourts : numCourts,
+                            startTime: configs.startTime !== undefined ? configs.startTime : startTime,
+                            gameDuration: configs.gameDuration !== undefined ? configs.gameDuration : gameDuration,
+                            breakDuration: configs.breakDuration !== undefined ? configs.breakDuration : breakDuration
+                        }
+                    });
+                }
+            };
+
+            // Realtime Sync Subscription Hook
+            useEffect(() => {
+                if (!supabaseClient) return;
+
+                const channel = supabaseClient.channel('pb-realtime-sync', {
+                    config: { broadcast: { self: false } }
+                });
+
+                channel
+                    .on('broadcast', { event: 'state-sync' }, ({ payload }) => {
+                        if (payload) {
+                            if (payload.teams) {
+                                setTeams(payload.teams);
+                                localStorage.setItem('pb_teams', JSON.stringify(payload.teams));
+                            }
+                            if (payload.matches) {
+                                setMatches(payload.matches);
+                                localStorage.setItem('pb_matches', JSON.stringify(payload.matches));
+                            }
+                            if (payload.tournamentType) {
+                                setTournamentType(payload.tournamentType);
+                                localStorage.setItem('pb_type', JSON.stringify(payload.tournamentType));
+                            }
+                            if (payload.numTeamsA) {
+                                setNumTeamsA(payload.numTeamsA);
+                                localStorage.setItem('pb_numTeamsA', JSON.stringify(payload.numTeamsA));
+                            }
+                            if (payload.numTeamsB) {
+                                setNumTeamsB(payload.numTeamsB);
+                                localStorage.setItem('pb_numTeamsB', JSON.stringify(payload.numTeamsB));
+                            }
+                            if (payload.maxGamesA) {
+                                setMaxGamesA(payload.maxGamesA);
+                                localStorage.setItem('pb_maxGamesA', JSON.stringify(payload.maxGamesA));
+                            }
+                            if (payload.maxGamesB) {
+                                setMaxGamesB(payload.maxGamesB);
+                                localStorage.setItem('pb_maxGamesB', JSON.stringify(payload.maxGamesB));
+                            }
+                            if (payload.numCourts !== undefined) setNumCourts(payload.numCourts);
+                            if (payload.startTime !== undefined) setStartTime(payload.startTime);
+                            if (payload.gameDuration !== undefined) setGameDuration(payload.gameDuration);
+                            if (payload.breakDuration !== undefined) setBreakDuration(payload.breakDuration);
+
+                            showToast("🔄 다른 기기로부터 실시간 변경사항이 반영되었습니다!");
+                        }
+                    })
+                    .on('broadcast', { event: 'request-state' }, () => {
+                        // Broadcast back current master state to newly joined client
+                        channel.send({
+                            type: 'broadcast',
+                            event: 'state-sync',
+                            payload: {
+                                teams: getLocalStorage('pb_teams', []),
+                                matches: getLocalStorage('pb_matches', []),
+                                tournamentType: getLocalStorage('pb_type', 'tournament'),
+                                numTeamsA: getLocalStorage('pb_numTeamsA', 8),
+                                numTeamsB: getLocalStorage('pb_numTeamsB', 9),
+                                maxGamesA: getLocalStorage('pb_maxGamesA', 5),
+                                maxGamesB: getLocalStorage('pb_maxGamesB', 5),
+                                numCourts,
+                                startTime,
+                                gameDuration,
+                                breakDuration
+                            }
+                        });
+                    })
+                    .subscribe((status) => {
+                        if (status === 'SUBSCRIBED') {
+                            // Signal other devices to send latest state if they are active
+                            channel.send({
+                                type: 'broadcast',
+                                event: 'request-state',
+                                payload: {}
+                            });
+                        }
+                    });
+
+                return () => {
+                    supabaseClient.removeChannel(channel);
+                };
+            }, [supabaseClient, numCourts, startTime, gameDuration, breakDuration, tournamentType, numTeamsA, numTeamsB, maxGamesA, maxGamesB]);
+
+            // Setup Storage Syncing across local browser tabs
             useEffect(() => {
                 const handleStorageUpdate = () => {
                     setTeams(getLocalStorage('pb_teams', []));
@@ -126,24 +308,6 @@
                 }, 12000);
                 return () => clearInterval(interval);
             }, [autoRotate]);
-
-            const showToast = (msg, isError = false) => {
-                setToast({ text: msg, isError });
-                setTimeout(() => setToast(null), 3000);
-            };
-
-            // Helper to get formatted player names (Resolves team name duplication completely)
-            const getPlayersString = (teamId) => {
-                if (!teamId || teamId === 'BYE' || teamId.startsWith('WAIT_')) return '';
-                const team = teams.find(t => t.id === teamId);
-                if (!team) return '선수명 미입력';
-                const p1 = team.player1;
-                const p2 = team.player2;
-                if (p1 || p2) {
-                    return [p1, p2].filter(Boolean).join(', ');
-                }
-                return '선수명 미입력';
-            };
 
             // Propagator engine to bubble wins upwards inside Single-Elimination tree structure safely
             const propagateWinners = (matchesList) => {
@@ -212,14 +376,8 @@
                 return updated;
             };
 
-            // Dynamic Seeding and Match Scheduler Builder with A/B balance
+            // Dynamic Seeding and Match Scheduler Builder with Balanced Court Routing
             const handleGenerateSchedule = () => {
-                setLocalStorage('pb_type', tournamentType);
-                setLocalStorage('pb_numTeamsA', numTeamsA);
-                setLocalStorage('pb_numTeamsB', numTeamsB);
-                setLocalStorage('pb_maxGamesA', maxGamesA);
-                setLocalStorage('pb_maxGamesB', maxGamesB);
-
                 const updatedTeams = [];
                 for(let i = 1; i <= numTeamsA; i++) {
                     const ex = teams.find(t => t.id === `A${i}`);
@@ -229,8 +387,6 @@
                     const ex = teams.find(t => t.id === `B${i}`);
                     updatedTeams.push(ex || { id: `B${i}`, group: 'B', name: `B${i}팀`, player1: '', player2: '' });
                 }
-                setTeams(updatedTeams);
-                setLocalStorage('pb_teams', updatedTeams);
 
                 let allGames = [];
 
@@ -251,6 +407,7 @@
                                         group: groupName, 
                                         team1Id: t1.id, 
                                         team2Id: t2.id, 
+                                        roundIndex: r + 1,
                                         roundName: `${r+1}R`,
                                         completed: false,
                                         score1: null,
@@ -343,13 +500,13 @@
                 }
 
                 // --- Advanced Unified Court Scheduler ---
-                // Filter out automatic BYE matches
+                // Filter out BYE matches
                 let matchesToSchedule = allGames.filter(m => {
                     const isByeMatch = m.team1Id === "BYE" || m.team2Id === "BYE";
                     return !isByeMatch;
                 });
 
-                // Weight rounds to schedule logically (R1 first, then 8강, then 4강, then Final)
+                // Weight rounds to schedule logically
                 const getRoundWeight = (roundName) => {
                     if (roundName.includes("1R")) return 1;
                     if (roundName.includes("8강")) return 2;
@@ -381,10 +538,10 @@
                     let slotMatches = [];
                     let usedTeamsInSlot = new Set();
                     
-                    // Decide which group gets priority in this slot to maintain A/B balance
+                    // Decides priority group based on ratio from last time slot
                     let priorityGroup = lastMajorityGroup === 'A' ? 'B' : 'A';
 
-                    // Retrieve teams that played in the immediately preceding slot (to implement rest constraint)
+                    // Retrieve teams that played in previous slot (rest constraint check)
                     const lastSlotTeams = new Set();
                     if (slotIndex > 0) {
                         const prevSlotTime = (() => {
@@ -411,27 +568,27 @@
                             return true;
                         };
 
-                        // Pass 1: Prefer group + No back-to-back play (soft rest rule)
+                        // 1. Prefer + Rested
                         let idx = matchesToSchedule.findIndex(m => checkMatch(m, preferGroup, lastSlotTeams));
                         if (idx !== -1) return idx;
 
-                        // Pass 2: Alternate group + No back-to-back play
+                        // 2. Alt + Rested
                         const altGroup = preferGroup === 'A' ? 'B' : 'A';
                         idx = matchesToSchedule.findIndex(m => checkMatch(m, altGroup, lastSlotTeams));
                         if (idx !== -1) return idx;
 
-                        // Pass 3: Prefer group (ignore soft rest)
+                        // 3. Prefer (Ignore soft rest)
                         idx = matchesToSchedule.findIndex(m => checkMatch(m, preferGroup, null));
                         if (idx !== -1) return idx;
 
-                        // Pass 4: Alternate group (ignore soft rest)
+                        // 4. Alt (Ignore soft rest)
                         idx = matchesToSchedule.findIndex(m => checkMatch(m, altGroup, null));
                         if (idx !== -1) return idx;
 
                         return -1;
                     };
 
-                    // Assign up to the available number of courts (e.g. max 3)
+                    // Distribute across active courts
                     for (let c = 0; c < numCourts; c++) {
                         let targetGroup = priorityGroup;
                         if (slotMatches.length > 0) {
@@ -450,9 +607,7 @@
                         }
                     }
 
-                    if (slotMatches.length === 0) {
-                        break;
-                    }
+                    if (slotMatches.length === 0) break;
 
                     const slotTimeMin = currentTimeMin + slotIndex * (Number(gameDuration) + Number(breakDuration));
                     const h = String(Math.floor(slotTimeMin / 60) % 24).padStart(2, '0');
@@ -461,7 +616,7 @@
 
                     slotMatches.forEach((match, idx) => {
                         match.time = timeString;
-                        match.court = `${idx + 1}코트`;
+                        match.court = `Court ${idx + 1}`;
                         scheduledMatches.push(match);
                     });
 
@@ -474,7 +629,7 @@
                     slotIndex++;
                 }
 
-                // Re-add bypassed BYE matches with auto-labels
+                // Append bypassed BYEs
                 const unscheduledByes = allGames.filter(m => {
                     const isByeMatch = m.team1Id === "BYE" || m.team2Id === "BYE";
                     return isByeMatch;
@@ -485,8 +640,7 @@
                     scheduledMatches.push(m);
                 });
 
-                setMatches(scheduledMatches);
-                setLocalStorage('pb_matches', scheduledMatches);
+                broadcastAndSave(updatedTeams, scheduledMatches, { tournamentType, numTeamsA, numTeamsB, maxGamesA, maxGamesB, numCourts, startTime, gameDuration, breakDuration });
                 showToast("🏆 A/B조 통합 균형 코트 배정 및 시간 슬롯 빌드가 완료되었습니다!");
             };
 
@@ -498,8 +652,8 @@
                     updated = propagateWinners(updated);
                 }
 
-                setMatches(updated);
-                setLocalStorage('pb_matches', updated);
+                // Broadcast score updates instantly across devices
+                broadcastAndSave(teams, updated);
                 if (completed) {
                     showToast("🔒 경기 결과가 안전하게 마감 및 저장되었습니다!");
                 }
@@ -507,11 +661,18 @@
 
             const updateTeamPlayers = (teamId, p1, p2) => {
                 const updated = teams.map(t => t.id === teamId ? { ...t, player1: p1, player2: p2 } : t);
-                setTeams(updated);
-                setLocalStorage('pb_teams', updated);
+                // Broadcast team roster changes to all screens
+                broadcastAndSave(updated, matches);
             };
 
-            // Dynamic League Rankings Engine
+            const handleSaveSupabaseKeys = (url, key) => {
+                setSupabaseUrl(url);
+                setSupabaseKey(key);
+                setLocalStorage('pb_supabase_url', url);
+                setLocalStorage('pb_supabase_key', key);
+                showToast("📡 Supabase 연동 정보가 로컬 저장소에 동기화되었습니다!");
+            };
+
             const getRankings = (groupName) => {
                 const groupTeams = teams.filter(t => t.group === groupName);
                 const groupMatches = matches.filter(m => m.group === groupName && m.completed && m.team1Id !== "BYE" && m.team2Id !== "BYE");
@@ -586,6 +747,22 @@
 
             const podium = getPodiumData();
 
+            // Court unified schedule computed view
+            const unifiedSchedule = useMemo(() => {
+                const active = matches.filter(m => m.court && m.court.startsWith('Court') && m.time !== "부전승 패스");
+                const slots = {};
+                active.forEach(m => {
+                    if (!slots[m.time]) slots[m.time] = [];
+                    slots[m.time].push(m);
+                });
+                
+                return Object.entries(slots).map(([time, courtMatches]) => {
+                    // Sort by court name Court 1 -> Court 2 -> Court 3
+                    courtMatches.sort((a, b) => a.court.localeCompare(b.court));
+                    return { time, courts: courtMatches };
+                }).sort((a, b) => a.time.localeCompare(b.time));
+            }, [matches]);
+
             const getTeamLabel = (id) => {
                 if (id.startsWith('WAIT_')) return '⏳ 승자 대기중';
                 if (id === 'BYE') return '부전승';
@@ -606,7 +783,10 @@
                             </div>
                             <div>
                                 <h1 className="text-2xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-yellow-400 via-amber-200 to-yellow-500 tracking-wider">CHURCH PICKLEBALL</h1>
-                                <p className="text-xs text-slate-400 font-semibold tracking-wider">교회 연합 피클볼 대회 실시간 관리 시스템</p>
+                                <div className="flex items-center gap-2">
+                                    <p className="text-xs text-slate-400 font-semibold tracking-wider">교회 연합 피클볼 대회 실시간 관리 시스템</p>
+                                    <span className={`inline-block w-2.5 h-2.5 rounded-full ${supabaseClient ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'}`} title={supabaseClient ? '실시간 DB 연동 활성화 상태' : '로컬 모드 단독 실행 상태'}></span>
+                                </div>
                             </div>
                         </div>
                         <nav className="flex bg-slate-950 p-1.5 rounded-2xl border border-slate-800 text-sm font-bold gap-1">
@@ -895,71 +1075,62 @@
                                                 LIVE MONITOR
                                             </span>
                                             <h2 className="text-2xl md:text-4xl font-black mt-2 tracking-tight">
-                                                실시간 체육관 코트별 매치 상황
+                                                실시간 체육관 코트별 매치 상황 (3코트 통합 시스템)
                                             </h2>
                                         </div>
 
-                                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                                            {[1, 2, 3, 4].slice(0, numCourts).map(courtNum => {
-                                                const courtName = `${courtNum}코트`;
-                                                const courtMatches = matches.filter(m => m.court === courtName);
-                                                
-                                                // Find current active and upcoming matches
-                                                const currentMatch = courtMatches.find(m => !m.completed && m.team1Id !== "BYE" && m.team2Id !== "BYE" && !m.team1Id.startsWith('WAIT_') && !m.team2Id.startsWith('WAIT_'));
-                                                const upcomingMatches = courtMatches.filter(m => !m.completed && m.team1Id !== "BYE" && m.team2Id !== "BYE");
-                                                const nextMatch = upcomingMatches.find(m => m.id !== (currentMatch?.id || ''));
+                                        {unifiedSchedule.length === 0 ? (
+                                            <div className="text-center py-20 bg-slate-900 rounded-3xl text-slate-500 font-bold border border-slate-800">
+                                                대진 스케줄러 탭에서 대진표를 먼저 생성해 주세요!
+                                            </div>
+                                        ) : (
+                                            <div className="space-y-8">
+                                                {unifiedSchedule.map((slot) => (
+                                                    <div key={slot.time} className="bg-slate-900/50 p-6 rounded-3xl border border-slate-800/80">
+                                                        <h3 className="text-xl font-extrabold text-teal-400 mb-4 border-b border-slate-800 pb-2 flex items-center gap-2">
+                                                            <span>⏰ {slot.time} 시간대</span>
+                                                            <span className="text-xs bg-slate-800 text-slate-400 px-3 py-1 rounded-full font-semibold">진행 예정</span>
+                                                        </h3>
+                                                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                                                            {slot.courts.map((m) => {
+                                                                const isT1Wait = m.team1Id && m.team1Id.startsWith('WAIT_');
+                                                                const isT2Wait = m.team2Id && m.team2Id.startsWith('WAIT_');
 
-                                                return (
-                                                    <div key={courtNum} className="bg-slate-900 border border-slate-800 rounded-3xl p-6 flex flex-col justify-between shadow-xl space-y-4">
-                                                        <div className="flex justify-between items-center border-b border-slate-800 pb-3">
-                                                            <h3 className="text-2xl font-black text-yellow-400">{courtName}</h3>
-                                                            <span className={`text-xs font-black px-3 py-1 rounded-full ${currentMatch ? 'bg-emerald-500/10 text-emerald-400 animate-pulse' : 'bg-slate-950 text-slate-500'}`}>
-                                                                {currentMatch ? '● 경기 진행 중' : '⚪ 대기 상태'}
-                                                            </span>
-                                                        </div>
-
-                                                        <div className="space-y-3 flex-1 py-2">
-                                                            <p className="text-[10px] font-black text-slate-500 tracking-wider">NOW PLAYING</p>
-                                                            {currentMatch ? (
-                                                                <div className="bg-slate-950 p-4 rounded-2xl border border-slate-800 space-y-2">
-                                                                    <div className="text-xs font-bold text-yellow-400/80">
-                                                                        [{currentMatch.group}조] {currentMatch.roundName}
+                                                                return (
+                                                                    <div key={m.id} className="bg-slate-950 p-5 rounded-2xl border border-slate-800 space-y-4 flex flex-col justify-between shadow-xl">
+                                                                        <div className="flex justify-between items-center border-b border-slate-900 pb-3">
+                                                                            <span className="text-lg font-black text-yellow-400">{m.court}</span>
+                                                                            <span className={`text-[10px] font-black px-2.5 py-0.5 rounded-full ${m.completed ? 'bg-slate-800 text-slate-500' : 'bg-emerald-500/10 text-emerald-400 animate-pulse'}`}>
+                                                                                {m.completed ? '마감됨' : '대기/진행중'}
+                                                                            </span>
+                                                                        </div>
+                                                                        <div className="space-y-3">
+                                                                            <div className="text-xs font-bold text-slate-500">
+                                                                                [{m.group}조 • {m.roundName}]
+                                                                            </div>
+                                                                            <div className="space-y-2">
+                                                                                <div className="flex flex-col text-left">
+                                                                                    <span className="text-base font-extrabold text-white">{isT1Wait ? '⏳ 승자 대기 중' : m.team1Id === 'BYE' ? '부전승' : m.team1Id}</span>
+                                                                                    <span className="text-xs text-slate-400 font-semibold">{getPlayersString(m.team1Id)}</span>
+                                                                                </div>
+                                                                                <div className="text-xs text-slate-600 font-black">VS</div>
+                                                                                <div className="flex flex-col text-left">
+                                                                                    <span className="text-base font-extrabold text-white">{isT2Wait ? '⏳ 승자 대기 중' : m.team2Id === 'BYE' ? '부전승' : m.team2Id}</span>
+                                                                                    <span className="text-xs text-slate-400 font-semibold">{getPlayersString(m.team2Id)}</span>
+                                                                                </div>
+                                                                            </div>
+                                                                        </div>
+                                                                        <div className="pt-3 text-center text-xl font-black text-yellow-400 bg-slate-900/60 rounded-xl py-2 border border-slate-800">
+                                                                            {m.score1 !== null ? m.score1 : 0} : {m.score2 !== null ? m.score2 : 0}
+                                                                        </div>
                                                                     </div>
-                                                                    <div className="text-sm font-extrabold text-white truncate">
-                                                                        {getTeamLabel(currentMatch.team1Id)}
-                                                                    </div>
-                                                                    <div className="text-xs text-slate-500 font-extrabold">VS</div>
-                                                                    <div className="text-sm font-extrabold text-white truncate">
-                                                                        {getTeamLabel(currentMatch.team2Id)}
-                                                                    </div>
-                                                                    <div className="pt-3 text-center text-2xl font-black text-yellow-400 bg-slate-900/60 rounded-xl mt-3 py-2 border border-slate-800">
-                                                                        {currentMatch.score1 !== null ? currentMatch.score1 : 0} : {currentMatch.score2 !== null ? currentMatch.score2 : 0}
-                                                                    </div>
-                                                                </div>
-                                                            ) : (
-                                                                <div className="text-sm font-bold text-slate-600 py-10 text-center bg-slate-950/40 rounded-2xl border border-dashed border-slate-800">
-                                                                    현재 배정된 실시간 경기가 없습니다.
-                                                                </div>
-                                                            )}
-                                                        </div>
-
-                                                        <div className="border-t border-slate-800/80 pt-4 space-y-2 text-left">
-                                                            <p className="text-[10px] font-black text-slate-500 tracking-wider">UPCOMING MATCH</p>
-                                                            {nextMatch ? (
-                                                                <div className="text-xs text-slate-400 font-bold flex items-center justify-between bg-slate-950/50 p-2.5 rounded-xl border border-slate-800">
-                                                                    <span className="truncate max-w-[80%]">
-                                                                        👉 {nextMatch.team1Id.startsWith('WAIT_') ? '대기조' : nextMatch.team1Id} vs {nextMatch.team2Id.startsWith('WAIT_') ? '대기조' : nextMatch.team2Id}
-                                                                    </span>
-                                                                    <span className="text-slate-500 text-[10px]">{nextMatch.time}</span>
-                                                                </div>
-                                                            ) : (
-                                                                <p className="text-[11px] font-bold text-slate-600">다음 대기 경기 없음</p>
-                                                            )}
+                                                                );
+                                                            })}
                                                         </div>
                                                     </div>
-                                                );
-                                            })}
-                                        </div>
+                                                ))}
+                                            </div>
+                                        )}
                                     </div>
                                 )}
                             </div>
@@ -1012,9 +1183,8 @@
                                                             <div className="font-extrabold text-sm text-white truncate">
                                                                 {isT1Wait ? '⏳ 승자 대기 중' : t1?.name}
                                                             </div>
-                                                            {/* 수정 반영: 팀 이름 중복 제거 및 선수 이름이 첫 줄 하단에 깔끔하게 출력됨 */}
                                                             {!isT1Wait && m.team1Id !== 'BYE' && (
-                                                                <div className="text-[11px] text-slate-400 bg-slate-950/40 py-1 rounded-lg px-2 mt-1 truncate">
+                                                                <div className="text-[11px] text-slate-400 bg-slate-950/40 py-1 rounded-lg px-2 mt-1 truncate font-semibold">
                                                                     {getPlayersString(m.team1Id)}
                                                                 </div>
                                                             )}
@@ -1040,9 +1210,8 @@
                                                             <div className="font-extrabold text-sm text-white truncate">
                                                                 {isT2Wait ? '⏳ 승자 대기 중' : t2?.name}
                                                             </div>
-                                                            {/* 수정 반영: 팀 이름 중복 제거 및 선수 이름이 첫 줄 하단에 깔끔하게 출력됨 */}
                                                             {!isT2Wait && m.team2Id !== 'BYE' && (
-                                                                <div className="text-[11px] text-slate-400 bg-slate-950/40 py-1 rounded-lg px-2 mt-1 truncate">
+                                                                <div className="text-[11px] text-slate-400 bg-slate-950/40 py-1 rounded-lg px-2 mt-1 truncate font-semibold">
                                                                     {getPlayersString(m.team2Id)}
                                                                 </div>
                                                             )}
@@ -1134,6 +1303,65 @@
                         {/* Tab 4: Scheduler & Match System Settings */}
                         {activeTab === 'schedule' && (
                             <div className="max-w-xl mx-auto space-y-6">
+                                {/* Supabase Sync Config Module */}
+                                <div className="bg-slate-900 border border-slate-800 p-6 rounded-3xl space-y-4 shadow-xl text-left">
+                                    <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                                        <div className="flex items-center gap-2">
+                                            <span className="text-xl">📡</span>
+                                            <h3 className="text-lg font-extrabold text-white">아이폰 - TV 대형 전광판 무선 실시간 연동</h3>
+                                        </div>
+                                        <span className={`px-2 py-0.5 text-[10px] rounded-lg font-bold ${supabaseClient ? 'bg-emerald-500/10 text-emerald-400' : 'bg-slate-950 text-slate-400'}`}>
+                                            {supabaseClient ? '연동 완료' : '로컬 모드'}
+                                        </span>
+                                    </div>
+                                    <p className="text-xs text-slate-400 leading-relaxed">
+                                        Supabase의 무료 실시간 통신을 사용합니다. 무료 프로젝트 생성 후 API 주소와 anon public key를 저장해 두시면 아이폰과 대형 화면 간 무선 0.1초 동기화가 가동됩니다.
+                                    </p>
+                                    <div className="space-y-3 pt-2">
+                                        <div className="space-y-1">
+                                            <label className="text-xs text-slate-400 font-bold">Supabase Project URL</label>
+                                            <input 
+                                                type="text" 
+                                                value={supabaseUrl} 
+                                                onChange={(e) => setSupabaseUrl(e.target.value)} 
+                                                placeholder="https://your-project-id.supabase.co" 
+                                                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs font-semibold text-slate-200 focus:outline-none focus:border-yellow-400"
+                                            />
+                                        </div>
+                                        <div className="space-y-1">
+                                            <label className="text-xs text-slate-400 font-bold">Supabase Anon Public Key</label>
+                                            <input 
+                                                type="password" 
+                                                value={supabaseKey} 
+                                                onChange={(e) => setSupabaseKey(e.target.value)} 
+                                                placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." 
+                                                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs font-semibold text-slate-200 focus:outline-none focus:border-yellow-400"
+                                            />
+                                        </div>
+                                        <div className="flex gap-2 pt-2">
+                                            <button 
+                                                onClick={() => handleSaveSupabaseKeys(supabaseUrl, supabaseKey)}
+                                                className="flex-1 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 hover:border-slate-600 rounded-xl text-xs font-bold transition-all text-yellow-400"
+                                            >
+                                                ✔ 연동 정보 저장 및 활성화
+                                            </button>
+                                            <button 
+                                                onClick={() => {
+                                                    setSupabaseUrl('');
+                                                    setSupabaseKey('');
+                                                    localStorage.removeItem('pb_supabase_url');
+                                                    localStorage.removeItem('pb_supabase_key');
+                                                    setSupabaseClient(null);
+                                                    showToast("📡 연동 정보가 초기화되었습니다. (단독 구동 모드)");
+                                                }}
+                                                className="px-4 py-2 bg-slate-950 hover:bg-slate-900 border border-slate-800 rounded-xl text-xs font-bold text-slate-500 hover:text-slate-400 transition-all"
+                                            >
+                                                초기화
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+
                                 <div className="bg-slate-900 border border-slate-800 p-6 rounded-3xl space-y-6 shadow-xl text-left">
                                     <div className="text-center space-y-1">
                                         <h3 className="text-xl font-extrabold text-white">⚙️ 스마트 대진 관리 환경설정</h3>
